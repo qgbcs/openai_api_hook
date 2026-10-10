@@ -289,6 +289,9 @@ class TokenBucket:
         self._tokens = float(burst)
         self._last = time.monotonic()
         self._lock = threading.Lock()
+        # 软限速：余量低于一半时按缺口比例渐进加延时，避免后半段瞬间耗尽触发 429
+        # 0 表示关闭；可由 RPC 调整，如 bucket.soft_delay_max = 30
+        self.soft_delay_max = 15.0
 
     def acquire(self):
         with self._lock:
@@ -301,17 +304,32 @@ class TokenBucket:
                 time.sleep(wait)
                 self._tokens = 0.0
                 self._last = time.monotonic()
-            else:
-                self._tokens -= 1.0
+                return
+            self._tokens -= 1.0
+            # 取到令牌后检查余量：低于一半则按缺口比例额外 sleep（余量越少延时越长）
+            half = self.burst / 2.0
+            if self.soft_delay_max > 0 and self._tokens < half:
+                deficit = 1.0 - (self._tokens / half)  # 0（刚好一半）→ 1（余量为 0）
+                extra = deficit * self.soft_delay_max
+                if extra > 0:
+                    logging.warning(
+                        "[%s] [soft] tokens=%.2f/%.0f 余量不足一半，渐进延时 %.1fs",
+                        _ts(), self._tokens, self.burst, extra
+                    )
+                    time.sleep(extra)
+                    now = time.monotonic()
+                    self._tokens = min(self.burst, self._tokens + (now - self._last) * self.rate)
+                    self._last = now
 
 
 # ─── 反向代理转发 ─────────────────────────────────────────────────────────────
 
 MAX_RETRIES = 3
 BASE_DELAY = 1.0
-# 429 无限重试参数
+# 429 重试参数
 RATE_LIMIT_MAX_DELAY = 60.0   # 单次最长等待秒数
 RATE_LIMIT_BACKOFF_CAP = 8   # 指数退避最大倍数（BASE_DELAY * 2^8 = 256s，取 min 与 RATE_LIMIT_MAX_DELAY）
+RATE_LIMIT_TOTAL_TIMEOUT = 90.0  # 单个请求 429 重试累计总时限（秒），超过则透传 429 让调用方快速失败，避免挂起超过调用方自身超时
 _detail_logger = DetailLogger()
 _req_counter = 0
 _req_lock = threading.Lock()
@@ -325,14 +343,15 @@ def _next_req_id():
 
 
 def forward_request(bucket, upstream_url, method, headers, body, path, stats):
-    """带限速 + 429 无限重试的转发，记录详细日志。
+    """带限速 + 429 自动重试的转发，记录详细日志。
 
-    - 429：挂起调用者，指数退避无限重试，直到上游返回非 429（不返回 429）。
+    - 429：挂起调用者指数退避重试；累计等待超过 RATE_LIMIT_TOTAL_TIMEOUT 则透传 429 让调用方快速失败。
     - 5xx / 网络错误：最多重试 MAX_RETRIES 次。
     """
     req_id = _next_req_id()
     attempt = 0              # 5xx / 网络错误重试计数（有上限 MAX_RETRIES）
-    rate_limit_attempt = 0   # 429 重试计数（无上限）
+    rate_limit_attempt = 0   # 429 重试计数
+    rate_limit_start = None  # 首次收到 429 的时间点，用于累计总时限
 
     # 记录请求详情
     _detail_logger.log_request(req_id, method, upstream_url + path, headers, body)
@@ -361,9 +380,11 @@ def forward_request(bucket, upstream_url, method, headers, body, path, stats):
             usage = extract_usage(resp_body)
             stats.record(method, path, resp.status, duration, usage)
 
-            # 429：不返回调用者，挂起无限重试直到非 429（不占用 attempt 配额）
+            # 429：挂起重试（受 RATE_LIMIT_TOTAL_TIMEOUT 总时限约束，超时透传 429）
             if resp.status == 429:
                 stats.record_429(path, resp_headers)
+                if rate_limit_start is None:
+                    rate_limit_start = time.monotonic()
                 delay = min(
                     BASE_DELAY * (2 ** min(rate_limit_attempt, RATE_LIMIT_BACKOFF_CAP)),
                     RATE_LIMIT_MAX_DELAY,
@@ -375,9 +396,18 @@ def forward_request(bucket, upstream_url, method, headers, body, path, stats):
                         delay = max(delay, float(ra))
                     except ValueError:
                         pass
+                waited = time.monotonic() - rate_limit_start
+                if waited + delay > RATE_LIMIT_TOTAL_TIMEOUT:
+                    # 已超过调用方可承受的总等待，透传 429 让其快速失败自行重试
+                    logging.warning(
+                        "[%s] [429] give-up attempt=%d path=%s waited=%.1fs > total_timeout=%.0fs，透传 429",
+                        _ts(), rate_limit_attempt, path, waited, RATE_LIMIT_TOTAL_TIMEOUT
+                    )
+                    _detail_logger.log_response(req_id, 429, resp_headers, resp_body)
+                    return 429, resp_headers, resp_body
                 logging.warning(
-                    "[%s] [429] auto-retry attempt=%d path=%s tokens=%.2f wait=%.1fs",
-                    _ts(), rate_limit_attempt, path, bucket._tokens, delay
+                    "[%s] [429] auto-retry attempt=%d path=%s tokens=%.2f wait=%.1fs waited=%.1fs",
+                    _ts(), rate_limit_attempt, path, bucket._tokens, delay, waited
                 )
                 _detail_logger.log_error(req_id, f"429 Too Many Requests (attempt {rate_limit_attempt})", duration)
                 rate_limit_attempt += 1
@@ -391,11 +421,13 @@ def forward_request(bucket, upstream_url, method, headers, body, path, stats):
             duration = time.monotonic() - t0
             status = e.code
 
-            # 429：挂起无限重试，不占用 attempt 配额
+            # 429：挂起重试（受 RATE_LIMIT_TOTAL_TIMEOUT 总时限约束，超时透传 429）
             if status == 429:
                 err_headers = list(e.headers.items())
                 stats.record(method, path, 429, duration)
                 stats.record_429(path, err_headers)
+                if rate_limit_start is None:
+                    rate_limit_start = time.monotonic()
                 delay = min(
                     BASE_DELAY * (2 ** min(rate_limit_attempt, RATE_LIMIT_BACKOFF_CAP)),
                     RATE_LIMIT_MAX_DELAY,
@@ -406,9 +438,18 @@ def forward_request(bucket, upstream_url, method, headers, body, path, stats):
                         delay = max(delay, float(ra))
                     except ValueError:
                         pass
+                waited = time.monotonic() - rate_limit_start
+                if waited + delay > RATE_LIMIT_TOTAL_TIMEOUT:
+                    logging.warning(
+                        "[%s] [429] give-up attempt=%d path=%s waited=%.1fs > total_timeout=%.0fs，透传 429",
+                        _ts(), rate_limit_attempt, path, waited, RATE_LIMIT_TOTAL_TIMEOUT
+                    )
+                    err_body = e.read() if not e.fp.closed else b""
+                    _detail_logger.log_response(req_id, 429, err_headers, err_body)
+                    return 429, err_headers, err_body
                 logging.warning(
-                    "[%s] [429] auto-retry attempt=%d path=%s tokens=%.2f wait=%.1fs",
-                    _ts(), rate_limit_attempt, path, bucket._tokens, delay
+                    "[%s] [429] auto-retry attempt=%d path=%s tokens=%.2f wait=%.1fs waited=%.1fs",
+                    _ts(), rate_limit_attempt, path, bucket._tokens, delay, waited
                 )
                 _detail_logger.log_error(req_id, f"429 Too Many Requests (attempt {rate_limit_attempt})", duration)
                 rate_limit_attempt += 1
