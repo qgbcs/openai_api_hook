@@ -44,36 +44,46 @@ def _ts():
     return datetime.now().strftime('%H:%M:%S.%f')[:-3]
 
 
+def set_console_title(text):
+    """把实时状态写入控制台窗口标题，不占用 stdout。
+    Windows 用 SetConsoleTitleW；其他平台用 ANSI OSC 转义。
+    """
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetConsoleTitleW(str(text))
+            return
+        except Exception:
+            pass
+    sys.stdout.write(f"\033]0;{text}\007")
+    sys.stdout.flush()
+
+
 # ─── 详细日志 ────────────────────────────────────────────────────────────────
 
 class DetailLogger:
-    """记录每个上游请求的完整细节（类似 curl -v）。"""
+    """请求/响应日志。默认紧凑单行：请求一行、回复一行。
+    RPC 可设置 _detail_logger.verbose = True 强制展开全部 header 与 body。
+    """
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._active = {}  # request_id -> {start, method, url, headers}
+        self._active = {}  # request_id -> {start, ts, method, url}
+        self.verbose = False
 
     def log_request(self, req_id, method, url, headers, body=None):
         with self._lock:
-            info = {
-                'start': time.monotonic(),
-                'ts': _ts(),
-                'method': method,
-                'url': url,
-                'headers': dict(headers),
-                'body_size': len(body) if body else 0,
+            self._active[req_id] = {
+                'start': time.monotonic(), 'ts': _ts(),
+                'method': method, 'url': url,
             }
-            self._active[req_id] = info
-            print(f"\n[{_ts()}] >>> REQUEST {req_id}")
-            print(f"  {method} {url}")
-            for k, v in headers.items():
-                print(f"  {k}: {v}")
-            if body:
-                try:
-                    body_str = body.decode('utf-8', errors='replace')[:500]
-                    print(f"  Body ({len(body)} bytes): {body_str}")
-                except:
-                    print(f"  Body ({len(body)} bytes): [binary]")
+            n = len(body) if body else 0
+            print(f"[{_ts()}] >>> #{req_id} {method} {url} body={n}B")
+            if self.verbose:
+                for k, v in headers.items():
+                    print(f"    {k}: {v}")
+                if body:
+                    self._print_body(body)
 
     def log_response(self, req_id, status, headers, body):
         with self._lock:
@@ -81,36 +91,41 @@ class DetailLogger:
             if not info:
                 return
             elapsed = time.monotonic() - info['start']
-            print(f"\n[{info['ts']}] <<< RESPONSE {req_id} ({elapsed*1000:.0f}ms)")
-            print(f"  HTTP/1.1 {status} {self._status_text(status)}")
             usage = extract_usage(body)
+            tok = ""
             if usage:
-                print(f"  TOKENS: prompt={usage.get('prompt_tokens')} "
-                      f"completion={usage.get('completion_tokens')} "
-                      f"total={usage.get('total_tokens')}")
-            for k, v in headers:
-                if k.lower() not in ('transfer-encoding', 'connection'):
-                    print(f"  {k}: {v}")
-            if body:
-                try:
-                    body_str = body.decode('utf-8', errors='replace')[:500]
-                    print(f"  Body ({len(body)} bytes): {body_str}")
-                except:
-                    print(f"  Body ({len(body)} bytes): [binary]")
-            print("-" * 60)
+                tok = (f" tok={usage.get('prompt_tokens')}+"
+                       f"{usage.get('completion_tokens')}="
+                       f"{usage.get('total_tokens')}")
+            print(f"[{info['ts']}] <<< #{req_id} {status} {self._status_text(status)} "
+                  f"{elapsed*1000:.0f}ms{tok}")
+            if self.verbose:
+                for k, v in headers:
+                    if k.lower() not in ('transfer-encoding', 'connection'):
+                        print(f"    {k}: {v}")
+                if body:
+                    self._print_body(body)
 
     def log_error(self, req_id, error, elapsed):
         with self._lock:
-            info = self._active.pop(req_id, None)
-            if info:
-                print(f"\n[{info['ts']}] !!! ERROR {req_id} ({elapsed*1000:.0f}ms): {error}")
+            # 不 pop：429 重试后还要记录最终响应，pop 会导致成功响应日志丢失
+            info = self._active.get(req_id)
+            ts = info['ts'] if info else _ts()
+            print(f"[{ts}] !!! #{req_id} {elapsed*1000:.0f}ms {error}")
+
+    @staticmethod
+    def _print_body(body):
+        try:
+            print(f"    body: {body.decode('utf-8', errors='replace')[:500]}")
+        except Exception:
+            print(f"    body: [{len(body)}B binary]")
 
     @staticmethod
     def _status_text(code):
         texts = {
             200: 'OK', 201: 'Created', 204: 'No Content',
             400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden',
-            404: 'Not Found', 429: 'Too Many Requests',
+            429: 'Too Many Requests',
             500: 'Internal Server Error', 502: 'Bad Gateway', 503: 'Service Unavailable',
         }
         return texts.get(code, 'Unknown')
@@ -313,7 +328,7 @@ class TokenBucket:
                 extra = deficit * self.soft_delay_max
                 if extra > 0:
                     logging.warning(
-                        "[%s] [soft] tokens=%.2f/%.0f 余量不足一半，渐进延时 %.1fs",
+                        "[%s] [soft] 令牌余量 %.1f/%.0f 不足一半，正在主动延迟 %.1fs",
                         _ts(), self._tokens, self.burst, extra
                     )
                     time.sleep(extra)
@@ -753,6 +768,10 @@ class V1ProxyHandler(RPCRequestHandler):
     def _is_v1_path(self):
         return self.path.startswith("/v1")
 
+    def log_message(self, fmt, *args):
+        # 紧凑日志：默认访问日志已由 DetailLogger 的单行请求/回复替代
+        pass
+
     def _send_synthetic(self, status, headers, body):
         if isinstance(body, str):
             body = body.encode("utf-8")
@@ -924,6 +943,12 @@ class ProxyManager:
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
+    # 重定向到文件时 stdout 默认块缓冲，会导致日志迟迟不落盘；强制行缓冲
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
     parser = argparse.ArgumentParser(description="本地聚合代理：RPC + Sapiens AI 反向代理 + 动态限速")
     parser.add_argument("--port", type=int, default=2255, help="监听端口（默认 2255）")
     # 默认值来自对真实上游的压测（详见 probe_ratelimit.py 与压测日志）：
@@ -994,40 +1019,31 @@ def main():
     print("按 Ctrl+C 退出")
     print("-" * 70)
 
-    # 实时速率显示线程
+    # 实时状态写入控制台窗口标题（不占用 stdout，避免与请求/回复行交错）
     def rate_display():
-        last_print = 0
         while True:
-            time.sleep(1)
-            now = time.monotonic()
-            if now - last_print >= 5:
-                last_print = now
-                status = proxy.get_status()
-                rate = status['instant_rate'] or status['rate_per_sec'].get('last_1s', 0)
-                tokens = bucket._tokens
+            time.sleep(2)
+            status = proxy.get_status()
+            rate = status['instant_rate'] or status['rate_per_sec'].get('last_1s', 0)
+            tokens = bucket._tokens
 
-                bar_len = 20
-                fill = int(rate / max(args.rate, 1)) * bar_len // max(int(args.rate), 1)
-                fill = min(fill, bar_len)
-                bar = '█' * fill + '░' * (bar_len - fill)
+            last_usage = status.get('last_usage')
+            if last_usage:
+                usage_str = (f" 最近tok {last_usage.get('prompt_tokens')}+"
+                             f"{last_usage.get('completion_tokens')}="
+                             f"{last_usage.get('total_tokens')}")
+            else:
+                usage_str = ""
+            total_tok = status.get('usage_total', {}).get('total_tokens', 0)
 
-                last_usage = status.get('last_usage')
-                if last_usage:
-                    usage_str = (f" 最近tok: {last_usage.get('prompt_tokens')}+"
-                                 f"{last_usage.get('completion_tokens')}="
-                                 f"{last_usage.get('total_tokens')}")
-                else:
-                    usage_str = ""
-                total_tok = status.get('usage_total', {}).get('total_tokens', 0)
-
-                sys.stdout.write(f"\r[{datetime.now().strftime('%H:%M:%S')}] "
-                               f"速率: {rate:.2f}/s [{bar}] "
-                               f"令牌: {tokens:.1f}/{args.burst} "
-                               f"成功: {status['success_count']} 失败: {status['error_count']} "
-                               f"429: {status['recent_429_count']}"
-                               f"{usage_str} 累计tok: {total_tok}"
-                               f"{' ← 限流触发！' if status['recent_429_count'] > 0 else ''}")
-                sys.stdout.flush()
+            title = (f"[{datetime.now().strftime('%H:%M:%S')}] "
+                     f"速率 {rate:.2f}/s "
+                     f"令牌 {tokens:.1f}/{args.burst} "
+                     f"成功 {status['success_count']} 失败 {status['error_count']} "
+                     f"429 {status['recent_429_count']}"
+                     f"{usage_str} 累计tok {total_tok}"
+                     f"{' 限流触发' if status['recent_429_count'] > 0 else ''}")
+            set_console_title(title)
 
     rate_thread = threading.Thread(target=rate_display, name='RateDisplay', daemon=True)
     rate_thread.start()
