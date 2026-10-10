@@ -654,6 +654,10 @@ class Interceptor:
         with self._lock:
             self._hooks = [(n, f) for n, f in self._hooks if n != name]
             self._hooks.append((name, fn))
+        # 加载说明从函数自身动态提取（docstring 首行），不由调用方硬编码
+        doc_lines = (getattr(fn, "__doc__", "") or "").strip().splitlines()
+        desc = doc_lines[0].strip() if doc_lines else ""
+        print(f"  内置hook: {name} 已开启{('（' + desc + '）') if desc else ''}")
         return f"已注册 hook: {name}"
 
     def remove_hook(self, name):
@@ -997,10 +1001,6 @@ def main():
     globals()['recorder'] = recorder
     globals()['interceptor'] = interceptor
 
-    server = ThreadedHTTPServer(('0.0.0.0', args.port), V1ProxyHandler)
-    thread = threading.Thread(target=server.serve_forever, name='Proxy_Server', daemon=True)
-    thread.start()
-
     print("=" * 70)
     print("本地聚合代理已启动")
     print(f"  监听:   http://127.0.0.1:{args.port}")
@@ -1008,16 +1008,20 @@ def main():
     print(f"  代理:   /v1/*   → {args.upstream}/v1")
     print(f"  限速:   {args.rate} req/s，突发 {args.burst}")
     print(f"  重试:   最多 {MAX_RETRIES} 次，指数退避 {BASE_DELAY}s 起")
+    import builtin_hooks; builtin_hooks.register_defaults(interceptor)
     print("=" * 70)
     print()
     print("测试:")
-    print(f"  curl http://127.0.0.1:{args.port}/r=dir()")
+    print(f" !curl 127.0.0.1:{args.port}/r=recorder.start(300)")
     print(f"  curl http://127.0.0.1:{args.port}/r=proxy.get_status()")
     print(f"  curl http://127.0.0.1:{args.port}/r=proxy.set_rate(2.0)")
     print(f"  curl http://127.0.0.1:{args.port}/v1/models")
     print()
     print("按 Ctrl+C 退出")
     print("-" * 70)
+
+    # hook 已注册完毕，此时才绑定端口开始服务，杜绝启动瞬间请求漏过 hook
+    server = ThreadedHTTPServer(('0.0.0.0', args.port), V1ProxyHandler)
 
     # 实时状态写入控制台窗口标题（不占用 stdout，避免与请求/回复行交错）
     def rate_display():
