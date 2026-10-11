@@ -682,7 +682,7 @@ def _sse_error_frame(payload):
 HEDGE_DELAY = 12
 
 
-def _stream_race_connection(parsed, method, headers, body, bucket):
+def _stream_race_connection(parsed, method, headers, body, bucket, hedge_enabled=True):
     """并行竞连接上游，返回首个可用响应 (conn, resp, wait_total, hedged)。
 
     实测上游坏连接率约 60%（TCP/TLS 连上但零字节），串行等 15s 超时会把请求
@@ -755,7 +755,8 @@ def _stream_race_connection(parsed, method, headers, body, bucket):
 
     while True:
         try:
-            tag, ok, c, r = result_q.get(timeout=(None if hedged else HEDGE_DELAY))
+            tag, ok, c, r = result_q.get(
+                timeout=(None if (hedged or not hedge_enabled) else HEDGE_DELAY))
         except _queue.Empty:
             # 主连接迟迟不出响应头：取第二个令牌开备用连接竞速
             wait_total += bucket.acquire()
@@ -795,7 +796,8 @@ def _stream_race_connection(parsed, method, headers, body, bucket):
         raise last_err
 
 
-def forward_stream(handler, bucket, upstream_url, method, headers, body, path, stats, client=None):
+def forward_stream(handler, bucket, upstream_url, method, headers, body, path, stats,
+                   client=None, stream_filter=None, hedge_enabled=True):
     """流式透传：立即回 SSE 响应头，等待上游期间用心跳帧给客户端保活。
 
     令牌桶排队、429 退避、上游首字节前的空等，都按 HEARTBEAT_INTERVAL
@@ -897,7 +899,7 @@ def forward_stream(handler, bucket, upstream_url, method, headers, body, path, s
             try:
                 # 并行竞速建连（内部取令牌：主连接 1 个，触发 hedge 时再取 1 个）
                 conn, resp, wait_total, hedged = _stream_race_connection(
-                    parsed, method, headers, body, bucket)
+                    parsed, method, headers, body, bucket, hedge_enabled=hedge_enabled)
                 _detail_logger.mark_sent(req_id, wait_total)
 
                 # 429：心跳继续，内部退避重试（受总时限约束）
@@ -962,8 +964,25 @@ def forward_stream(handler, bucket, upstream_url, method, headers, body, path, s
                     break
 
                 # 200：逐块透传；心跳线程继续负责 chunk 间空闲保活
+                # stream_filter（由 RPC hook 经 action 注入，代理核心不含策略）：
+                # feed() 可重写/注入 SSE 事件；任何异常立即摘除过滤器退回原始
+                # 透传（fail-open），绝不让修复逻辑本身拖垮正常响应。
                 delivered = False
                 ttfb_ms = None
+                filter_dead = False
+
+                def apply_filter(raw):
+                    nonlocal filter_dead
+                    if stream_filter is None or filter_dead:
+                        return raw
+                    try:
+                        return stream_filter.feed(raw)
+                    except Exception:
+                        filter_dead = True
+                        logging.exception("[%s] [stream] stream_filter 异常，摘除并回退原始透传",
+                                          _ts())
+                        return raw
+
                 while True:
                     try:
                         chunk = resp.read(4096)
@@ -981,23 +1000,39 @@ def forward_stream(handler, bucket, upstream_url, method, headers, body, path, s
                         break
                     if not chunk:
                         break
-                    resp_buf.extend(chunk)
+                    out = apply_filter(chunk)
+                    if out:
+                        resp_buf.extend(out)
+                        try:
+                            cwrite(out)
+                            if not delivered:
+                                delivered = True
+                                ttfb_ms = (time.monotonic() - t0) * 1000
+                                stream_state["first_event"] = True
+                                # 已开始出字：放宽 chunk 间等待，允许长回答慢慢吐
+                                try:
+                                    conn.sock.settimeout(MID_STREAM_TIMEOUT)
+                                except Exception:
+                                    pass
+                        except OSError:
+                            client_gone = True
+                            logging.warning(
+                                "[%s] [client] 流式透传中调用方断开，已丢弃后续上游数据", _ts())
+                            break
+                # 上游正常结束：给过滤器补齐/收尾注入的机会（如补闭合标签）
+                if delivered and stream_filter is not None and not filter_dead:
                     try:
-                        cwrite(chunk)
-                        if not delivered:
-                            delivered = True
-                            ttfb_ms = (time.monotonic() - t0) * 1000
-                            stream_state["first_event"] = True
-                            # 已开始出字：放宽 chunk 间等待，允许长回答慢慢吐
-                            try:
-                                conn.sock.settimeout(MID_STREAM_TIMEOUT)
-                            except Exception:
-                                pass
-                    except OSError:
-                        client_gone = True
-                        logging.warning(
-                            "[%s] [client] 流式透传中调用方断开，已丢弃后续上游数据", _ts())
-                        break
+                        tail = stream_filter.flush()
+                    except Exception:
+                        filter_dead = True
+                        logging.exception("[%s] [stream] stream_filter flush 异常，摘除", _ts())
+                        tail = None
+                    if tail:
+                        resp_buf.extend(tail)
+                        try:
+                            cwrite(tail)
+                        except OSError:
+                            client_gone = True
                 duration = time.monotonic() - t0
                 stats.record(method, path, 200, duration, extract_usage(bytes(resp_buf)))
                 final_status = 200
@@ -1230,17 +1265,51 @@ class Interceptor:
         return [n for n, _ in self._hooks]
 
     def run(self, req):
-        """依次执行 hook，返回首个非 None action；异常的 hook 跳过不阻断请求。"""
+        """依次执行 hook。
+
+        - block/respond/allow：终结 hook 链立即返回（allow 会带上前序 modify
+          已累积的 body/过滤器）；
+        - modify：链式叠加——改写结果写回 req 供后续 hook 继续判定，body 以
+          最后一个 modify 为准，headers 合并，stream_filter 透传保留。
+        异常的 hook 跳过不阻断请求。
+        """
+        merged = None
         for name, fn in list(self._hooks):
             try:
                 action = fn(req)
             except Exception:
                 logging.exception("[interceptor] hook %s 异常，跳过", name)
                 continue
-            if action:
-                action.setdefault("hook", name)
+            if not action:
+                continue
+            action.setdefault("hook", name)
+            kind = action.get("action", "allow")
+            if kind != "modify":
+                if kind == "allow" and merged is not None:
+                    return merged     # 前序 modify 已累积，放行其改写结果
                 return action
-        return None
+            # 改写结果回写 req_ctx，让后续 hook 基于最新 body 判定
+            if "body" in action:
+                nb = action["body"]
+                body = nb.encode("utf-8") if isinstance(nb, str) else nb
+                req["body"] = body
+                req["body_text"] = body.decode("utf-8", errors="replace")
+                try:
+                    req["json"] = json.loads(req["body_text"])
+                except (ValueError, TypeError):
+                    req["json"] = None
+            if action.get("headers"):
+                req.setdefault("headers", {}).update(action["headers"])
+            if merged is None:
+                merged = dict(action)
+            else:
+                if action.get("headers"):
+                    merged.setdefault("headers", {}).update(action["headers"])
+                if "body" in action:
+                    merged["body"] = action["body"]
+                if action.get("stream_filter"):
+                    merged["stream_filter"] = action["stream_filter"]
+        return merged
 
     # ---- 挂起 / 决策（供 RPC hook 调用） ----
 
@@ -1387,6 +1456,8 @@ class V1ProxyHandler(RPCRequestHandler):
 
         # 2) 拦截 hook（策略完全由 RPC 定义）；拦截发生在取令牌之前，不消耗配额
         action = self.interceptor.run(req_ctx) if self.interceptor else None
+        stream_filter = None      # hook 可经 modify action 注入流式响应过滤器
+        hedge_enabled = True      # hook 可经 modify action 的 hedge=False 关闭并发竞速
         if action:
             act = action.get("action", "allow")
             if act in ("block", "respond"):
@@ -1402,6 +1473,11 @@ class V1ProxyHandler(RPCRequestHandler):
                 if "body" in action:
                     nb = action["body"]
                     body = nb.encode("utf-8") if isinstance(nb, str) else nb
+            flt = action.get("stream_filter")
+            if flt is not None and hasattr(flt, "feed") and hasattr(flt, "flush"):
+                stream_filter = flt
+            if action.get("hedge") is False:
+                hedge_enabled = False
             # allow → 继续转发
 
         # 3) 转发到上游（流式请求走透传+心跳，其余走缓冲转发）
@@ -1410,7 +1486,8 @@ class V1ProxyHandler(RPCRequestHandler):
             if _is_stream_body(body):
                 status, resp_headers, resp_body, already_sent = forward_stream(
                     self, self.bucket, self.upstream, method, headers, body,
-                    self.path, self.stats, client=self.client_address)
+                    self.path, self.stats, client=self.client_address,
+                    stream_filter=stream_filter, hedge_enabled=hedge_enabled)
             else:
                 status, resp_headers, resp_body = forward_request(
                     self.bucket, self.upstream, method, headers, body, self.path,

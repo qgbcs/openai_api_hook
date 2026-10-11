@@ -14,6 +14,7 @@
 import json
 import logging
 import sys
+import time
 
 # 上游每个请求只保留最后 4 个图片 part（按 image part 计数，与图片
 # 大小、请求总大小、含图消息条数均无关：实测 1x1 迷你图第 5 个照样
@@ -139,6 +140,299 @@ def fix_empty_user_parts(req):
             "headers": {"Content-Length": str(len(body))}}
 
 
+# ─── 对话压缩（compact）摘要修复 ─────────────────────────────────────────────
+#
+# 背景（2026-10-11 实测，录制见 recordings/）：Trae 的“压缩历史”由 ai-agent
+# 把 /compact 转成一个普通流式 OpenAI 请求，最后一条 user 消息是固定的摘要
+# 指令（见下方 SUMMARY_PROMPT_MARK），要求模型把摘要包在 <summary></summary>
+# 里。该请求经“ai-agent → Trae 云端中转 → 本地隧道 → 本代理 → agnes”，
+# 云端中转对整轮响应有约 60s 总时限，超时直接回 "upstream failed to respond
+# (HTTP Status: 502)"（4028 CUSTOM_MODEL_ORIGIN_ERROR）。
+#
+# 实测失败链：
+#   1) 首次请求带全量历史（120k tokens）+ 27 个工具定义，模型 13s 就出完，
+#      但漏掉 <summary> 包裹标签 → ai-agent 判格式不符，丢弃并重发；
+#   2) 截断重试（98k/66k/6k tokens）虽然格式合格，但 agnes 大上下文 prefill
+#      慢，整轮 33~69s，越过云端 60s deadline → 502，压缩失败。
+#
+# 修复（两层，全部在本 hook 内，核心代理只提供通用 feed/flush 机制）：
+#   请求侧：识别摘要请求后移除 tools/tool_choice（ai-agent 自己重试时也会
+#           去掉），并在指令末尾强化标签要求；
+#   响应侧：SummaryTagGuard 逐 SSE 事件保证正文以 <summary> 开头、
+#           finish 前补 </summary>。首次请求本来就快（~13s），格式一保
+#           证，压缩在云端时限内即可完成，不会进入截断重试。
+
+SUMMARY_PROMPT_MARK = "Your task is to create a detailed summary of the conversation so far"
+SUMMARY_OPEN = "<summary>"
+SUMMARY_CLOSE = "</summary>"
+_FORMAT_HINT = (
+    "\n\nIMPORTANT OUTPUT FORMAT: Output ONLY the summary itself, wrapped exactly in "
+    "<summary></summary> tags as shown in the example above. Your response MUST begin "
+    f"with {SUMMARY_OPEN} and end with {SUMMARY_CLOSE}, with no text before or after the tags."
+)
+
+
+def _last_user_text(messages):
+    """返回最后一条 user 消息的文本（str 内容或 list parts 拼接）及是否可改写。"""
+    for m in reversed(messages):
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            return c, "str"
+        if isinstance(c, list):
+            parts = [p.get("text", "") for p in c
+                     if isinstance(p, dict) and p.get("type") == "text"]
+            if parts:
+                return "\n".join(parts), "list"
+    return None, None
+
+
+class SummaryTagGuard:
+    """流式 SSE 标签守卫（feed/flush 协议由 local_proxy 调用）。
+
+    仅做确定性的标签补齐，不改写模型正文：
+      - 首个正文片段若不是 <summary> 开头，先注入一个开标签事件；
+      - 全程扫描正文，正文已含 </summary> 则不补；
+      - finish_reason 到达（或流结束）时仍缺闭标签，注入一个闭标签事件。
+    任何上游非 data 帧、心跳注释帧、[DONE]、无 content 的帧原样透传。
+    """
+
+    def __init__(self, model=""):
+        self._model = model or ""
+        self._buf = b""              # 半条 SSE 事件的残余字节
+        self._hold = b""             # 开标签判定前缓存的完整事件
+        self._lead = ""              # 判定前累计的开头正文
+        self._decided = False        # 是否已确定开标签处理
+        self._has_open = False
+        self._has_close = False
+        self._seen_content = False
+        self.injected = {"open": False, "close": False}
+        # 诊断时序（毫秒，相对守卫创建=请求即将转发上游）：定位云端
+        # stream_retry_policy 到底卡在首 token、流中停顿还是完成确认
+        self._t0 = time.monotonic()
+        self._t_first_frame = None
+        self._t_first_content = None
+        self._t_last_content = None
+        self._t_finish = None
+        self._t_done = None
+        self._max_gap = 0.0
+        self._text_tail = ""          # 已转发正文末尾滚动窗口：跨帧检测闭标签
+
+    def _ms(self):
+        return (time.monotonic() - self._t0) * 1000.0
+
+    def _note_text(self, content):
+        """记录一段正文，滚动窗口跨帧检测闭标签。
+
+        模型常把 ``</summary>`` 拆成两个 delta（如 ``</summary`` + ``>``），
+        只在单帧内 ``in`` 会漏检，导致结尾重复注入闭标签。
+        """
+        tail = self._text_tail + content
+        if SUMMARY_CLOSE in tail:
+            self._has_close = True
+        self._text_tail = tail[-(len(SUMMARY_CLOSE) - 1):]
+
+    def _timing_log(self):
+        logging.warning(
+            "[fix_compact_summary] 响应时序 first_frame=%sms first_content=%sms "
+            "last_content=%sms finish=%sms done=%sms 最大帧间隔=%.0fms 补标签=%s",
+            None if self._t_first_frame is None else int(self._t_first_frame),
+            None if self._t_first_content is None else int(self._t_first_content),
+            None if self._t_last_content is None else int(self._t_last_content),
+            None if self._t_finish is None else int(self._t_finish),
+            None if self._t_done is None else int(self._t_done),
+            self._max_gap, self.injected)
+
+    def _inject(self, text):
+        obj = {
+            "id": "chatcmpl-proxy-compactfix",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": self._model,
+            "choices": [{"index": 0, "delta": {"content": text},
+                         "finish_reason": None}],
+        }
+        return b"data: " + json.dumps(obj, ensure_ascii=False).encode("utf-8") + b"\n\n"
+
+    def _decide_open(self):
+        """根据累计开头正文判定：自然开标签 / 需注入开标签。返回 (done, inject?)。"""
+        stripped = self._lead.lstrip()
+        if not stripped:
+            return False, None          # 还只是空白，继续等
+        if SUMMARY_OPEN.startswith(stripped) and len(stripped) < len(SUMMARY_OPEN):
+            return False, None          # 正在形成标签前缀，再等几个字符
+        if stripped.startswith(SUMMARY_OPEN):
+            self._has_open = True
+            return True, False
+        return True, True               # 首字符不可能形成标签 → 需要注入
+
+    def _on_event(self, raw):
+        """处理一条完整的 SSE 事件（含结尾 \\n\\n），返回应转发的字节。"""
+        if not raw.startswith(b"data:"):
+            return raw                  # 注释帧等原样透传
+        now = self._ms()
+        if self._t_first_frame is None:
+            self._t_first_frame = now
+        payload = raw[5:].lstrip(b" ")
+        if payload.rstrip(b"\r\n") == b"[DONE]":
+            self._t_done = now
+            return self._finish(raw)
+        try:
+            ev = json.loads(payload)
+        except (ValueError, TypeError):
+            return self._release(raw)
+        choices = ev.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return self._release(raw)
+        delta = choices[0].get("delta") or {}
+        content = delta.get("content")
+        finish = choices[0].get("finish_reason")
+        if finish:
+            self._t_finish = now
+
+        if isinstance(content, str) and content:
+            self._seen_content = True
+            if self._t_first_content is None:
+                self._t_first_content = now
+            elif self._t_last_content is not None:
+                self._max_gap = max(self._max_gap, now - self._t_last_content)
+            self._t_last_content = now
+            self._note_text(content)
+            if not self._decided:
+                self._hold += raw
+                self._lead += content
+                done, do_inject = self._decide_open()
+                if not done:
+                    return b""
+                self._decided = True
+                held, self._hold = self._hold, b""
+                self._lead = ""
+                if do_inject:
+                    self.injected["open"] = True
+                    return self._inject(SUMMARY_OPEN + "\n") + held
+                return held
+            return raw
+
+        if finish and not (isinstance(content, str) and content):
+            return self._finish(raw)
+        return self._release(raw)
+
+    def _release(self, raw):
+        """判定期间外的帧直接放行；若还有 hold 先吐出。"""
+        if self._hold:
+            held, self._hold = self._hold, b""
+            return held + raw
+        return raw
+
+    def _finish(self, raw):
+        """终结帧到达前补闭标签（finish 帧与 [DONE] 都会进入，靠 _has_close 去重）。"""
+        out = self._release(b"")
+        if self._seen_content and not self._has_close:
+            self.injected["close"] = True
+            self._has_close = True
+            out += self._inject("\n" + SUMMARY_CLOSE)
+        return out + raw
+
+    def feed(self, data):
+        out = []
+        self._buf += data
+        while b"\n\n" in self._buf:
+            raw, self._buf = self._buf.split(b"\n\n", 1)
+            out.append(self._on_event(raw + b"\n\n"))
+        return b"".join(out)
+
+    def flush(self):
+        out = []
+        # 残余半个事件：正常不会有（上游均以 \n\n 结尾），兜底原样发出
+        if self._buf:
+            tail, self._buf = self._buf, b""
+            if not self._decided:
+                self._decided = True
+                if self._hold:
+                    held, self._hold = self._hold, b""
+                    stripped = self._lead.lstrip()
+                    if not stripped.startswith(SUMMARY_OPEN):
+                        self.injected["open"] = True
+                        out.append(self._inject(SUMMARY_OPEN + "\n"))
+                    out.append(held)
+            out.append(tail)
+        if self._hold:
+            held, self._hold = self._hold, b""
+            stripped = self._lead.lstrip()
+            if not self._decided and not stripped.startswith(SUMMARY_OPEN):
+                self.injected["open"] = True
+                out.append(self._inject(SUMMARY_OPEN + "\n"))
+            out.append(held)
+        if self._seen_content and not self._has_close:
+            self.injected["close"] = True
+            self._has_close = True
+            out.append(self._inject("\n" + SUMMARY_CLOSE))
+        self._timing_log()
+        if self.injected["open"] or self.injected["close"]:
+            logging.warning("[fix_compact_summary] 摘要标签补齐 open=%s close=%s",
+                            self.injected["open"], self.injected["close"])
+        return b"".join(out)
+
+
+def fix_compact_summary(req):
+    """压缩摘要请求：移除工具定义、强化标签格式指令、挂响应标签守卫
+
+    识别条件：最后一条 user 消息以 ai-agent 固定摘要指令开头。只对这类
+    请求生效，普通对话完全不受影响。
+    """
+    data = req.get("json")
+    if not isinstance(data, dict):
+        return None
+    messages = data.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return None
+    text, _kind = _last_user_text(messages)
+    # 真实流量中该 user 消息前面常带数百字 IDE system-reminder（打开文件
+    # 通知、语言设置等），摘要指令在消息中部，必须全消息匹配
+    if not text or SUMMARY_PROMPT_MARK not in text:
+        return None
+
+    data = dict(data)
+    messages = [dict(m) for m in messages]
+    data["messages"] = messages
+    notes = []
+
+    # 1) 摘要调用不需要任何工具（ai-agent 自身的截断重试也不带工具）
+    if "tools" in data:
+        data.pop("tools", None)
+        data.pop("tool_choice", None)
+        notes.append("移除工具定义")
+
+    # 2) 在摘要指令末尾强化标签要求
+    last = messages[-1]
+    for m in reversed(messages):
+        if isinstance(m, dict) and m.get("role") == "user":
+            last = m
+            break
+    c = last.get("content")
+    if isinstance(c, str):
+        last["content"] = c + _FORMAT_HINT
+        notes.append("追加格式指令")
+    elif isinstance(c, list):
+        for p in reversed(c):
+            if isinstance(p, dict) and p.get("type") == "text":
+                p["text"] = p.get("text", "") + _FORMAT_HINT
+                notes.append("追加格式指令")
+                break
+
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    guard = SummaryTagGuard(model=data.get("model", ""))
+    # 压缩请求 prefill 本来就慢，hedge 会同时打两条相同大请求抢占上游算力，
+    # 反而拖慢首字；此通道由 hook 按请求关闭，核心默认行为不变
+    logging.warning("[fix_compact_summary] 命中压缩摘要请求：%s", "；".join(notes))
+    return {"action": "modify",
+            "body": body,
+            "headers": {"Content-Length": str(len(body))},
+            "stream_filter": guard,
+            "hedge": False}
+
+
 def register_defaults(interceptor):
     """注册默认开启的内置 hook；加载说明由 Interceptor.add_hook 动态打印。
 
@@ -148,5 +442,7 @@ def register_defaults(interceptor):
         interceptor.add_hook(interceptor.builtin_hooks.fix_empty_user_parts)
     """
     interceptor.builtin_hooks = sys.modules[__name__]
+    # 压缩摘要修复先注册：modify 可链式叠加，其后 sanitize 仍会作用于改写体
+    interceptor.add_hook(fix_compact_summary)
     interceptor.add_hook(sanitize_chat_messages)
 
