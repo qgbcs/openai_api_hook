@@ -606,6 +606,242 @@ def forward_request(bucket, upstream_url, method, headers, body, path, stats):
                     pass
 
 
+# ─── 流式透传 + SSE 心跳保活 ──────────────────────────────────────────────────
+
+# 流式请求等待上游期间，按此间隔向客户端发 SSE 注释帧防断；RPC 可直接改
+HEARTBEAT_INTERVAL = 5.0
+
+
+def _is_stream_body(body):
+    """hook 处理后的 body 是否为流式（stream=true）请求。"""
+    if not body:
+        return False
+    try:
+        return json.loads(body.decode("utf-8", errors="replace")).get("stream") is True
+    except (ValueError, UnicodeDecodeError):
+        return False
+
+
+def _sse_error_frame(payload):
+    """把上游错误体包装成单行 JSON 的 SSE data 帧。"""
+    if isinstance(payload, bytes):
+        payload = payload.decode("utf-8", errors="replace")
+    try:
+        obj = json.loads(payload)
+        data = json.dumps(obj, ensure_ascii=False)
+    except (ValueError, TypeError):
+        data = json.dumps({"error": {"message": payload[:2000]}}, ensure_ascii=False)
+    return ("data: " + data + "\n\n").encode("utf-8")
+
+
+def forward_stream(handler, bucket, upstream_url, method, headers, body, path, stats):
+    """流式透传：立即回 SSE 响应头，等待上游期间用心跳帧给客户端保活。
+
+    令牌桶排队、429 退避、上游首字节前的空等，都按 HEARTBEAT_INTERVAL
+    发送 SSE 注释帧（``: heartbeat``，SSE 客户端必须忽略），调用方读
+    连接持续有字节，不会触发读空闲超时。上游 200 响应逐块透传；429
+    仍在内部退避重试（不写客户端）。
+
+    代价：响应头已提前按 200 发出，上游最终非 200（非 429）时错误只能
+    以 SSE error data 帧传达。返回 (status, headers, body, already_sent)。
+    """
+    req_id = _next_req_id()
+    attempt = 0
+    rate_limit_attempt = 0
+    rate_limit_start = None
+
+    _detail_logger.log_request(req_id, method, upstream_url + path, headers, body)
+
+    full_url = upstream_url.rstrip("/") + path
+    parsed = urllib.parse.urlparse(full_url)
+
+    write_lock = threading.Lock()
+
+    def cwrite(data):
+        with write_lock:
+            handler.wfile.write(data)
+            handler.wfile.flush()
+
+    # 排队/等待前先发出 SSE 响应头（hook 已在调用处处理完 block）
+    try:
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        handler.send_header("Cache-Control", "no-cache")
+        handler.send_header("X-Accel-Buffering", "no")
+        handler.end_headers()
+        handler.wfile.flush()
+        handler.close_connection = True  # 无 Content-Length，以连接关闭定界
+    except OSError as e:
+        logging.warning("[%s] [client] 流式响应头未发出客户端已断开：%s", _ts(), e)
+        return 499, [], b"", True
+
+    stop_beat = threading.Event()
+
+    def heartbeat():
+        while not stop_beat.wait(HEARTBEAT_INTERVAL):
+            try:
+                cwrite(b": heartbeat\n\n")
+            except OSError:
+                return  # 客户端断开，透传循环写时会感知并收尾
+
+    beat_thread = threading.Thread(target=heartbeat, name="sse-heartbeat", daemon=True)
+    beat_thread.start()
+
+    final_status = 0
+    final_headers = []
+    resp_buf = bytearray()
+    client_gone = False
+
+    def finish(status, hdr):
+        nonlocal final_status, final_headers
+        final_status, final_headers = status, hdr
+
+    try:
+        while True:
+            wait = bucket.acquire()
+            _detail_logger.mark_sent(req_id, wait)
+            t0 = time.monotonic()
+            conn = None
+            try:
+                if parsed.scheme == "https":
+                    conn = HTTPSConnection(parsed.hostname, parsed.port or 443, timeout=120)
+                else:
+                    conn = HTTPConnection(parsed.hostname, parsed.port or 80, timeout=120)
+
+                conn.request(method, parsed.path, body=body, headers=headers)
+                resp = conn.getresponse()
+
+                # 429：心跳继续，内部退避重试（受总时限约束）
+                if resp.status == 429:
+                    rb = resp.read()
+                    duration = time.monotonic() - t0
+                    stats.record(method, path, 429, duration)
+                    stats.record_429(path, resp.getheaders())
+                    if rate_limit_start is None:
+                        rate_limit_start = time.monotonic()
+                    delay = min(
+                        BASE_DELAY * (2 ** min(rate_limit_attempt, RATE_LIMIT_BACKOFF_CAP)),
+                        RATE_LIMIT_MAX_DELAY)
+                    ra = resp.headers.get("Retry-After")
+                    if ra:
+                        try:
+                            delay = max(delay, float(ra))
+                        except ValueError:
+                            pass
+                    waited = time.monotonic() - rate_limit_start
+                    if waited + delay > RATE_LIMIT_TOTAL_TIMEOUT:
+                        logging.warning(
+                            "[%s] [429] stream give-up waited=%.1fs，以 SSE 错误帧结束",
+                            _ts(), waited)
+                        try:
+                            cwrite(_sse_error_frame(
+                                '{"error":{"message":"upstream rate limited too long","code":429}}'))
+                        except OSError:
+                            client_gone = True
+                        finish(429, resp.getheaders())
+                        resp_buf.extend(rb)
+                        break
+                    _detail_logger.log_error(
+                        req_id, f"429 Too Many Requests (attempt {rate_limit_attempt})", duration)
+                    rate_limit_attempt += 1
+                    time.sleep(delay)
+                    continue
+
+                # 5xx：尚未透传任何上游字节，可安全重试
+                if resp.status >= 500 and attempt < MAX_RETRIES:
+                    resp.read()
+                    duration = time.monotonic() - t0
+                    stats.record(method, path, resp.status, duration)
+                    _detail_logger.log_error(req_id, f"{resp.status} upstream error", duration)
+                    attempt += 1
+                    time.sleep(BASE_DELAY * (2 ** (attempt - 1)))
+                    continue
+
+                final_headers = resp.getheaders()
+
+                # 非 200 终结响应（400/401/403/放弃重试的 5xx）：错误帧传达
+                if resp.status != 200:
+                    err = resp.read()
+                    duration = time.monotonic() - t0
+                    stats.record(method, path, resp.status, duration)
+                    resp_buf.extend(err)
+                    try:
+                        cwrite(_sse_error_frame(err))
+                    except OSError:
+                        client_gone = True
+                    final_status = resp.status
+                    break
+
+                # 200：逐块透传；心跳线程继续负责 chunk 间空闲保活
+                delivered = False
+                while True:
+                    try:
+                        chunk = resp.read(4096)
+                    except (socket.timeout, TimeoutError) as e:
+                        if not delivered:
+                            # 一个上游字节都没转发：抛出走外层连接重试
+                            raise
+                        # 已部分透传，不能重发：错误帧收尾
+                        try:
+                            cwrite(_sse_error_frame(
+                                '{"error":{"message":"upstream read timeout mid-stream"}}'))
+                        except OSError:
+                            client_gone = True
+                        logging.warning("[%s] [stream] 透传中途上游读取超时，已发错误帧", _ts())
+                        break
+                    if not chunk:
+                        break
+                    resp_buf.extend(chunk)
+                    try:
+                        cwrite(chunk)
+                        delivered = True
+                    except OSError:
+                        client_gone = True
+                        logging.warning(
+                            "[%s] [client] 流式透传中调用方断开，已丢弃后续上游数据", _ts())
+                        break
+                duration = time.monotonic() - t0
+                stats.record(method, path, 200, duration, extract_usage(bytes(resp_buf)))
+                final_status = 200
+                break
+
+            except (urllib.error.URLError, OSError) as e:
+                duration = time.monotonic() - t0
+                if attempt < MAX_RETRIES:
+                    stats.record(method, path, 0, duration)
+                    logging.warning("[%s] [conn] stream attempt=%d wait: %s", _ts(), attempt, e)
+                    _detail_logger.log_error(req_id, str(e), duration)
+                    attempt += 1
+                    time.sleep(BASE_DELAY * (2 ** (attempt - 1)))
+                    continue
+                stats.record(method, path, 502, duration)
+                payload = json.dumps(
+                    {"error": {"message": f"upstream connection failed: {e}"}},
+                    ensure_ascii=False)
+                try:
+                    cwrite(_sse_error_frame(payload))
+                except OSError:
+                    client_gone = True
+                final_status = 502
+                resp_buf.extend(payload.encode("utf-8"))
+                break
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+    finally:
+        stop_beat.set()
+
+    _detail_logger.log_response(req_id, final_status, final_headers, bytes(resp_buf))
+    if client_gone:
+        logging.warning(
+            "[%s] [client] 调用方流式接收中断，上游实际返回 %d，%dB 未送达",
+            _ts(), final_status, len(resp_buf))
+    return final_status, final_headers, bytes(resp_buf), True
+
+
 # ─── 请求完整录制 ─────────────────────────────────────────────────────────────
 
 def _encode_body(body):
