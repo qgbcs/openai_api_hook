@@ -433,6 +433,40 @@ def fix_compact_summary(req):
             "hedge": False}
 
 
+# ─── 子代理（Task/search）纯透传 ────────────────────────────────────────────
+#
+# 实测（2026-10-12，recordings/rec_20261012_001539.jsonl #60-#71）：Trae 的
+# Task 工具派出的 file-search 子代理，其请求被字节不变地重发 12 次，每次
+# 上游都 200 完整返回合法 tool_calls，云端调用链仍判失败换 IDC（HL/LF/LQ）
+# 重发，约 70s 后给客户端 502。主会话同样的心跳帧机制全程正常，仅子代理
+# 路径受影响——该链路对代理注入帧（首字节前零内容 assistant 帧 / 流中
+# 注释帧）不容忍。对这类请求关闭心跳与 hedge，纯透传上游 SSE。
+
+SUBAGENT_SYSTEM_MARKS = (
+    "You are a file search specialist for Trae IDE",
+)
+
+
+def subagent_passthrough(req):
+    """识别 Trae 子代理请求：不改 body，仅关闭心跳注入与 hedge 竞速。"""
+    data = req.get("json")
+    if not isinstance(data, dict):
+        return None
+    messages = data.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return None
+    sys_text = ""
+    for m in messages[:2]:
+        if isinstance(m, dict) and m.get("role") == "system":
+            c = m.get("content")
+            if isinstance(c, str):
+                sys_text += c
+    if not any(mark in sys_text for mark in SUBAGENT_SYSTEM_MARKS):
+        return None
+    logging.warning("[subagent_passthrough] 命中子代理请求：关闭心跳与竞速，纯透传")
+    return {"action": "modify", "hedge": False, "heartbeat": False}
+
+
 def register_defaults(interceptor):
     """注册默认开启的内置 hook；加载说明由 Interceptor.add_hook 动态打印。
 
@@ -444,5 +478,6 @@ def register_defaults(interceptor):
     interceptor.builtin_hooks = sys.modules[__name__]
     # 压缩摘要修复先注册：modify 可链式叠加，其后 sanitize 仍会作用于改写体
     interceptor.add_hook(fix_compact_summary)
+    interceptor.add_hook(subagent_passthrough)
     interceptor.add_hook(sanitize_chat_messages)
 

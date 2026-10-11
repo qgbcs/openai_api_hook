@@ -797,7 +797,8 @@ def _stream_race_connection(parsed, method, headers, body, bucket, hedge_enabled
 
 
 def forward_stream(handler, bucket, upstream_url, method, headers, body, path, stats,
-                   client=None, stream_filter=None, hedge_enabled=True):
+                   client=None, stream_filter=None, hedge_enabled=True,
+                   heartbeat_enabled=True):
     """流式透传：立即回 SSE 响应头，等待上游期间用心跳帧给客户端保活。
 
     令牌桶排队、429 退避、上游首字节前的空等，都按 HEARTBEAT_INTERVAL
@@ -877,6 +878,8 @@ def forward_stream(handler, bucket, upstream_url, method, headers, body, path, s
 
     def heartbeat():
         while not stop_beat.wait(HEARTBEAT_INTERVAL):
+            if not heartbeat_enabled:
+                continue  # hook 按请求关闭：纯透传，不注入任何帧
             frame = b": heartbeat\n\n" if stream_state["first_event"] else empty_event_frame()
             try:
                 cwrite(frame)
@@ -1309,6 +1312,11 @@ class Interceptor:
                     merged["body"] = action["body"]
                 if action.get("stream_filter"):
                     merged["stream_filter"] = action["stream_filter"]
+                # hedge/heartbeat 关闭标志粘性：任一 hook 要求关即保持关
+                if action.get("hedge") is False:
+                    merged["hedge"] = False
+                if action.get("heartbeat") is False:
+                    merged["heartbeat"] = False
         return merged
 
     # ---- 挂起 / 决策（供 RPC hook 调用） ----
@@ -1458,6 +1466,7 @@ class V1ProxyHandler(RPCRequestHandler):
         action = self.interceptor.run(req_ctx) if self.interceptor else None
         stream_filter = None      # hook 可经 modify action 注入流式响应过滤器
         hedge_enabled = True      # hook 可经 modify action 的 hedge=False 关闭并发竞速
+        heartbeat_enabled = True  # hook 可经 modify action 的 heartbeat=False 纯透传
         if action:
             act = action.get("action", "allow")
             if act in ("block", "respond"):
@@ -1478,6 +1487,8 @@ class V1ProxyHandler(RPCRequestHandler):
                 stream_filter = flt
             if action.get("hedge") is False:
                 hedge_enabled = False
+            if action.get("heartbeat") is False:
+                heartbeat_enabled = False
             # allow → 继续转发
 
         # 3) 转发到上游（流式请求走透传+心跳，其余走缓冲转发）
@@ -1487,7 +1498,8 @@ class V1ProxyHandler(RPCRequestHandler):
                 status, resp_headers, resp_body, already_sent = forward_stream(
                     self, self.bucket, self.upstream, method, headers, body,
                     self.path, self.stats, client=self.client_address,
-                    stream_filter=stream_filter, hedge_enabled=hedge_enabled)
+                    stream_filter=stream_filter, hedge_enabled=hedge_enabled,
+                    heartbeat_enabled=heartbeat_enabled)
             else:
                 status, resp_headers, resp_body = forward_request(
                     self.bucket, self.upstream, method, headers, body, self.path,
