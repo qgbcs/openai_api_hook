@@ -73,10 +73,13 @@ class DetailLogger:
 
     def log_request(self, req_id, method, url, headers, body=None):
         with self._lock:
+            now = time.monotonic()
             self._active[req_id] = {
-                'start': time.monotonic(), 'ts': _ts(),
-                'method': method, 'url': url,
+                'arrival': now, 'start': now, 'wait': 0.0,
+                'ts': _ts(), 'method': method, 'url': url,
             }
+            # 请求一到达（读完 body）立即留痕：即使后续在令牌桶排队，
+            # 日志里也能看到未配对的 >>>，不会出现“调用方超时但日志空白”
             n = len(body) if body else 0
             print(f"[{_ts()}] >>> #{req_id} {method} {url} body={n}B")
             if self.verbose:
@@ -85,20 +88,29 @@ class DetailLogger:
                 if body:
                     self._print_body(body)
 
+    def mark_sent(self, req_id, wait):
+        """令牌等待结束、实际发送上游时调用：记录等待时长并重置计时起点。"""
+        with self._lock:
+            info = self._active.get(req_id)
+            if info is not None:
+                if info['wait'] == 0.0 and wait:
+                    info['wait'] = wait          # 只记首次发送前的等待
+                info['start'] = time.monotonic()  # 之后只统计纯上游耗时
+
     def log_response(self, req_id, status, headers, body):
         with self._lock:
             info = self._active.pop(req_id, None)
             if not info:
                 return
-            elapsed = time.monotonic() - info['start']
+            up_ms = (time.monotonic() - info['start']) * 1000
             usage = extract_usage(body)
+            wait_s = f" wait={info['wait']:.1f}s" if info['wait'] > 0.05 else ""
             tok = ""
             if usage:
-                tok = (f" tok={usage.get('prompt_tokens')}+"
-                       f"{usage.get('completion_tokens')}="
-                       f"{usage.get('total_tokens')}")
+                tok = (f" sent={usage.get('prompt_tokens')} "
+                       f"recv={usage.get('completion_tokens')}")
             print(f"[{info['ts']}] <<< #{req_id} {status} {self._status_text(status)} "
-                  f"{elapsed*1000:.0f}ms{tok}")
+                  f"up={up_ms:.0f}ms{wait_s}{tok}")
             if self.verbose:
                 for k, v in headers:
                     if k.lower() not in ('transfer-encoding', 'connection'):
@@ -309,6 +321,8 @@ class TokenBucket:
         self.soft_delay_max = 15.0
 
     def acquire(self):
+        """取一个令牌，返回实际等待秒数（令牌硬等 + 软延迟之和）。"""
+        delayed = 0.0
         with self._lock:
             now = time.monotonic()
             elapsed = now - self._last
@@ -319,7 +333,7 @@ class TokenBucket:
                 time.sleep(wait)
                 self._tokens = 0.0
                 self._last = time.monotonic()
-                return
+                return wait
             self._tokens -= 1.0
             # 取到令牌后检查余量：低于一半则按缺口比例额外 sleep（余量越少延时越长）
             half = self.burst / 2.0
@@ -327,14 +341,12 @@ class TokenBucket:
                 deficit = 1.0 - (self._tokens / half)  # 0（刚好一半）→ 1（余量为 0）
                 extra = deficit * self.soft_delay_max
                 if extra > 0:
-                    logging.warning(
-                        "[%s] [soft] 令牌余量 %.1f/%.0f 不足一半，正在主动延迟 %.1fs",
-                        _ts(), self._tokens, self.burst, extra
-                    )
                     time.sleep(extra)
                     now = time.monotonic()
                     self._tokens = min(self.burst, self._tokens + (now - self._last) * self.rate)
                     self._last = now
+                    delayed = extra
+        return delayed
 
 
 # ─── 反向代理转发 ─────────────────────────────────────────────────────────────
@@ -368,15 +380,17 @@ def forward_request(bucket, upstream_url, method, headers, body, path, stats):
     rate_limit_attempt = 0   # 429 重试计数
     rate_limit_start = None  # 首次收到 429 的时间点，用于累计总时限
 
-    # 记录请求详情
+    # 请求到达立即留痕（排队等待期间也能在日志看到这条 >>>）
     _detail_logger.log_request(req_id, method, upstream_url + path, headers, body)
 
     full_url = upstream_url.rstrip("/") + path
     parsed = urllib.parse.urlparse(full_url)
 
     while True:
+        wait = bucket.acquire()
+        # 实际发送上游：记录代理内部等待时长，计时起点切到发送时刻
+        _detail_logger.mark_sent(req_id, wait)
         t0 = time.monotonic()
-        bucket.acquire()
 
         conn = None
         try:
@@ -861,17 +875,24 @@ class V1ProxyHandler(RPCRequestHandler):
         self.recorder.capture_response(seq, status, dict(resp_headers), resp_body)
 
         # 5) 回写客户端
-        self.send_response(status)
-        skip_resp = {"transfer-encoding", "connection", "keep-alive", "trailer"}
-        for k, v in resp_headers:
-            if k.lower() in skip_resp:
-                continue
-            self.send_header(k, v)
-        ct = dict(resp_headers).get("Content-Type", "application/json")
-        self.send_header("Content-Type", ct)
-        self.end_headers()
-        if resp_body:
-            self.wfile.write(resp_body)
+        try:
+            self.send_response(status)
+            skip_resp = {"transfer-encoding", "connection", "keep-alive", "trailer"}
+            for k, v in resp_headers:
+                if k.lower() in skip_resp:
+                    continue
+                self.send_header(k, v)
+            ct = dict(resp_headers).get("Content-Type", "application/json")
+            self.send_header("Content-Type", ct)
+            self.end_headers()
+            if resp_body:
+                self.wfile.write(resp_body)
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            # 上游已正常返回，但调用方（如 IDE）等不及提前断开——
+            # 典型表现：客户端报 Connection timeout，代理侧却是 200
+            logging.warning(
+                "[%s] [client] 调用方在收到响应前断开（多为客户端超时），上游实际返回 %d，%dB 已丢弃：%s",
+                _ts(), status, len(resp_body or b""), e)
 
     def do_GET(self):
         if self._is_v1_path():
