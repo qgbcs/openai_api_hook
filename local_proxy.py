@@ -15,15 +15,14 @@ import logging
 import sys
 import time
 import threading
-import urllib.request
-import urllib.error
+import urllib.parse
 import os
 import statistics
 import socket
 import ssl
 from collections import deque
 from datetime import datetime
-from http.client import HTTPConnection, HTTPSConnection
+from http.client import HTTPConnection, HTTPSConnection, HTTPException
 from socketserver import ThreadingMixIn
 
 
@@ -45,7 +44,7 @@ def _ts():
 
 
 def set_console_title(text):
-    """把实时状态写入控制台窗口标题，不占用 stdout。
+    """把实时状态写入控制台窗口标题，不占用 stdout，避免与请求/回复行交错。
     Windows 用 SetConsoleTitleW；其他平台用 ANSI OSC 转义。
     """
     if sys.platform == "win32":
@@ -59,6 +58,58 @@ def set_console_title(text):
     sys.stdout.flush()
 
 
+# ─── 文件同步日志 ──────────────────────────────────────────────────────────────
+
+LIVE_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxy.live.log")
+
+
+class _Tee:
+    """一次写多个流（控制台 + 文件），线程安全；任何一个流挂掉不影响其他。"""
+
+    def __init__(self, *streams):
+        self._streams = streams
+        self._lock = threading.Lock()
+
+    def write(self, data):
+        with self._lock:
+            for st in self._streams:
+                try:
+                    st.write(data)
+                    st.flush()
+                except Exception:
+                    pass
+
+    def flush(self):
+        for st in self._streams:
+            try:
+                st.flush()
+            except Exception:
+                pass
+
+    def reconfigure(self, **kwargs):
+        for st in self._streams:
+            try:
+                st.reconfigure(**kwargs)
+            except Exception:
+                pass
+
+
+def install_file_logging():
+    """stdout/stderr 与 logging 全量同步到 proxy.live.log（追加模式）。
+
+    无论是否重定向启动、有没有控制台窗口，现场日志都在文件里。
+    """
+    logf = open(LIVE_LOG_PATH, "a", encoding="utf-8", buffering=1)
+    sys.stdout = _Tee(sys.stdout, logf)
+    sys.stderr = _Tee(sys.stderr, logf)
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+    print(f"\n================ 代理启动 {datetime.now():%Y-%m-%d %H:%M:%S} pid={os.getpid()} ================")
+    return logf
+
+
 # ─── 详细日志 ────────────────────────────────────────────────────────────────
 
 class RecentRing:
@@ -67,6 +118,7 @@ class RecentRing:
     RPC 用法：
       recent.list()                  摘要（id/时刻/状态/大小/耗时/重试）
       recent.get(-1)                 最新一条完整内容（headers+body）
+      recent.get(37)                 按请求 ID（日志 >>> #N 的 N）查询
       recent.get(-1)["resp_body"]    只看上游响应原文
     """
 
@@ -110,18 +162,44 @@ class RecentRing:
                 'resp_bytes': len(x.get('resp_body') or b'') if x.get('resp_body') else 0,
                 'wait_s': round(x.get('wait', 0.0), 2),
                 'up_ms': round(x.get('up_ms', 0.0)) if x.get('up_ms') else None,
+                'ttfb_ms': round(x.get('ttfb_ms')) if x.get('ttfb_ms') else None,
                 'retries': len(x.get('retry_events', [])),
             } for x in self._items]
 
-    def get(self, idx=-1):
-        """返回一条完整快照（文本化的 headers/body），默认最新一条。"""
+    def _resolve(self, key):
+        """把 key 解析成环形缓冲中的一条记录。
+
+        非负整数优先按请求 ID（日志 >>> #N）匹配；匹配不到再退回
+        deque 下标。负数始终按下标（-1 最新）。
+        """
+        if isinstance(key, int) and key >= 0:
+            for x in self._items:
+                if x.get('id') == key:
+                    return x
+        try:
+            return self._items[key]
+        except IndexError:
+            ids = [x.get('id') for x in self._items]
+            if isinstance(key, int) and key >= 0:
+                raise KeyError(
+                    f"找不到请求 ID={key} 的快照（仅保留最近 {len(ids)} 条，"
+                    f"可用 ID: {ids}）")
+            raise
+
+    def get(self, key=-1):
+        """返回一条完整快照（文本化的 headers/body），默认最新一条。
+
+        key 可以是请求 ID（如 recent.get(37)），也可以是下标
+        （-1 最新、0 最旧）；非负整数优先按请求 ID 匹配。
+        """
         with self._lock:
-            x = self._items[idx]
+            x = self._resolve(key)
             return {
                 'id': x.get('id'), 'arrival': x.get('arrival'),
                 'method': x.get('method'), 'path': x.get('path'),
                 'status': x.get('status'),
                 'wait_s': x.get('wait', 0.0), 'up_ms': x.get('up_ms'),
+                'ttfb_ms': x.get('ttfb_ms'),
                 'req_headers': self._mask_headers(x.get('req_headers')),
                 'req_body': self._text(x.get('req_body')),
                 'resp_headers': x.get('resp_headers'),
@@ -140,14 +218,15 @@ class DetailLogger:
         self._lock = threading.Lock()
         self._active = {}  # request_id -> 日志/快照条目
         self.verbose = False
-        self.recent = RecentRing(cap=3)
+        self.recent = RecentRing(cap=20)
 
-    def log_request(self, req_id, method, url, headers, body=None):
+    def log_request(self, req_id, method, url, headers, body=None, client=None):
         with self._lock:
             now = time.monotonic()
             item = {
                 'id': req_id, 'arrival': _ts(), 'method': method,
                 'path': url, 'req_headers': headers, 'req_body': body,
+                'client': client,
                 'start': now, 'wait': 0.0, 'retry_events': [],
             }
             self._active[req_id] = item
@@ -155,7 +234,8 @@ class DetailLogger:
             # 请求一到达（读完 body）立即留痕：即使后续在令牌桶排队，
             # 日志里也能看到未配对的 >>>，不会出现“调用方超时但日志空白”
             n = len(body) if body else 0
-            print(f"[{_ts()}] >>> #{req_id} {method} {url} body={n}B")
+            who = f"{client[0]}:{client[1]} " if client else ""
+            print(f"[{_ts()}] >>> #{req_id} {who}{method} {url} body={n}B")
             if self.verbose:
                 for k, v in headers.items():
                     print(f"    {k}: {v}")
@@ -171,16 +251,18 @@ class DetailLogger:
                     info['wait'] = wait          # 只记首次发送前的等待
                 info['start'] = time.monotonic()  # 之后只统计纯上游耗时
 
-    def log_response(self, req_id, status, headers, body):
+    def log_response(self, req_id, status, headers, body, ttfb_ms=None):
         with self._lock:
             info = self._active.pop(req_id, None)
             if not info:
                 return
             up_ms = (time.monotonic() - info['start']) * 1000
             info.update({'status': status, 'up_ms': up_ms,
+                         'ttfb_ms': ttfb_ms,
                          'resp_headers': headers, 'resp_body': body})
             usage = extract_usage(body)
             wait_s = f" wait={info['wait']:.1f}s" if info['wait'] > 0.05 else ""
+            ttfb_s = f" ttfb={ttfb_ms:.0f}ms" if ttfb_ms is not None else ""
             n_retry = len(info['retry_events'])
             retry_s = f" retry={n_retry}" if n_retry else ""
             tok = ""
@@ -188,7 +270,7 @@ class DetailLogger:
                 tok = (f" sent={usage.get('prompt_tokens')} "
                        f"recv={usage.get('completion_tokens')}")
             print(f"[{info['arrival']}] <<< #{req_id} {status} {self._status_text(status)} "
-                  f"up={up_ms:.0f}ms{wait_s}{retry_s}{tok}")
+                  f"up={up_ms:.0f}ms{ttfb_s}{wait_s}{retry_s}{tok}")
             if self.verbose:
                 for k, v in headers:
                     if k.lower() not in ('transfer-encoding', 'connection'):
@@ -455,7 +537,7 @@ def _next_req_id():
         return _req_counter
 
 
-def forward_request(bucket, upstream_url, method, headers, body, path, stats):
+def forward_request(bucket, upstream_url, method, headers, body, path, stats, client=None):
     """带限速 + 429 自动重试的转发，记录详细日志。
 
     - 429：挂起调用者指数退避重试；累计等待超过 RATE_LIMIT_TOTAL_TIMEOUT 则透传 429 让调用方快速失败。
@@ -467,10 +549,12 @@ def forward_request(bucket, upstream_url, method, headers, body, path, stats):
     rate_limit_start = None  # 首次收到 429 的时间点，用于累计总时限
 
     # 请求到达立即留痕（排队等待期间也能在日志看到这条 >>>）
-    _detail_logger.log_request(req_id, method, upstream_url + path, headers, body)
+    _detail_logger.log_request(req_id, method, upstream_url + path, headers, body, client)
 
     full_url = upstream_url.rstrip("/") + path
     parsed = urllib.parse.urlparse(full_url)
+    # http.client 的 request target 只给 path 会丢 query，必须显式拼回
+    request_target = parsed.path + (("?" + parsed.query) if parsed.query else "")
 
     while True:
         wait = bucket.acquire()
@@ -486,7 +570,7 @@ def forward_request(bucket, upstream_url, method, headers, body, path, stats):
             else:
                 conn = HTTPConnection(parsed.hostname, parsed.port or 80, timeout=120)
 
-            conn.request(method, parsed.path, body=body, headers=headers)
+            conn.request(method, request_target, body=body, headers=headers)
             resp = conn.getresponse()
             resp_body = resp.read()
             resp_headers = [(k, v) for k, v in resp.getheaders()]
@@ -532,59 +616,10 @@ def forward_request(bucket, upstream_url, method, headers, body, path, stats):
             _detail_logger.log_response(req_id, resp.status, resp_headers, resp_body)
             return resp.status, resp_headers, resp_body
 
-        except urllib.error.HTTPError as e:
-            duration = time.monotonic() - t0
-            status = e.code
-
-            # 429：挂起重试（受 RATE_LIMIT_TOTAL_TIMEOUT 总时限约束，超时透传 429）
-            if status == 429:
-                err_headers = list(e.headers.items())
-                stats.record(method, path, 429, duration)
-                stats.record_429(path, err_headers)
-                if rate_limit_start is None:
-                    rate_limit_start = time.monotonic()
-                delay = min(
-                    BASE_DELAY * (2 ** min(rate_limit_attempt, RATE_LIMIT_BACKOFF_CAP)),
-                    RATE_LIMIT_MAX_DELAY,
-                )
-                ra = e.headers.get("Retry-After")
-                if ra:
-                    try:
-                        delay = max(delay, float(ra))
-                    except ValueError:
-                        pass
-                waited = time.monotonic() - rate_limit_start
-                if waited + delay > RATE_LIMIT_TOTAL_TIMEOUT:
-                    logging.warning(
-                        "[%s] [429] give-up attempt=%d path=%s waited=%.1fs > total_timeout=%.0fs，透传 429",
-                        _ts(), rate_limit_attempt, path, waited, RATE_LIMIT_TOTAL_TIMEOUT
-                    )
-                    err_body = e.read() if not e.fp.closed else b""
-                    _detail_logger.log_response(req_id, 429, err_headers, err_body)
-                    return 429, err_headers, err_body
-                logging.warning(
-                    "[%s] [429] auto-retry attempt=%d path=%s tokens=%.2f wait=%.1fs waited=%.1fs",
-                    _ts(), rate_limit_attempt, path, bucket._tokens, delay, waited
-                )
-                _detail_logger.log_error(req_id, f"429 Too Many Requests (attempt {rate_limit_attempt})", duration)
-                rate_limit_attempt += 1
-                time.sleep(delay)
-                continue
-
-            if status >= 500 and attempt < MAX_RETRIES:
-                delay = BASE_DELAY * (2 ** attempt)
-                logging.warning("[%s] [%d] attempt=%d path=%s wait=%.1fs", _ts(), status, attempt, path, delay)
-                attempt += 1
-                time.sleep(delay)
-                continue
-
-            # 其他状态（含 4xx）直接返回调用者
-            err_body = e.read() if not e.fp.closed else b""
-            stats.record(method, path, status, duration)
-            _detail_logger.log_response(req_id, status, list(e.headers.items()), err_body)
-            return status, list(e.headers.items()), err_body
-
-        except (urllib.error.URLError, OSError) as e:
+        except (OSError, HTTPException) as e:
+            # http.client 不抛 HTTPError/URLError（那是 urllib.request 层的异常）：
+            # 任何 HTTP 状态码都由 getresponse() 返回。这里只捕获连接层错误：
+            # socket 超时/重置等 OSError，以及 BadStatusLine 等 HTTPException。
             duration = time.monotonic() - t0
             if attempt < MAX_RETRIES:
                 delay = BASE_DELAY * (2 ** attempt)
@@ -608,8 +643,17 @@ def forward_request(bucket, upstream_url, method, headers, body, path, stats):
 
 # ─── 流式透传 + SSE 心跳保活 ──────────────────────────────────────────────────
 
-# 流式请求等待上游期间，按此间隔向客户端发 SSE 注释帧防断；RPC 可直接改
-HEARTBEAT_INTERVAL = 5.0
+# 流式请求等待上游期间，按此间隔向客户端发心跳防断；RPC 可直接改。
+# 实测 IDE 首事件窗口约 5s 且有调度抖动：5s 间隔曾在 5.3s 断连（帧差 0.3s
+# 没赶上），2s 间隔保证窗口内至少到达 2 个有效事件。
+HEARTBEAT_INTERVAL = 2.0
+# 上游首字节（含响应头与第一个 SSE chunk）等待上限。
+# 实测会遇到“TCP/TLS 连上但上游长时间零字节”的坏连接：120s 才超时重试时，
+# 调用方（IDE 约 30s 首事件窗口）早已断开。15s 快速放弃坏连接并重试，
+# 绝大多数重试在数秒内成功；模块全局，RPC 可实时调整。
+FIRST_BYTE_TIMEOUT = 30
+# 首个 chunk 透传之后，chunk 间间隔的等待上限（长回答允许较慢）
+MID_STREAM_TIMEOUT = 120.0
 
 
 def _is_stream_body(body):
@@ -634,7 +678,124 @@ def _sse_error_frame(payload):
     return ("data: " + data + "\n\n").encode("utf-8")
 
 
-def forward_stream(handler, bucket, upstream_url, method, headers, body, path, stats):
+# 主连接在该秒数内没返回响应头，就开第二条连接竞速（坏连接高发时避免白等 15s）
+HEDGE_DELAY = 12
+
+
+def _stream_race_connection(parsed, method, headers, body, bucket):
+    """并行竞连接上游，返回首个可用响应 (conn, resp, wait_total, hedged)。
+
+    实测上游坏连接率约 60%（TCP/TLS 连上但零字节），串行等 15s 超时会把请求
+    总时长拖过调用方约 30s 的总 deadline。竞速：主连接 HEDGE_DELAY 秒内没出
+    响应头就再取一个令牌开备用连接，谁先返回 200 用谁，另一条立即关闭。
+    所有连接都失败时抛最后一个异常；返回非 200 响应（429/5xx）交给调用方。
+    """
+    import queue as _queue
+    result_q = _queue.Queue()
+    conns = {}
+    conn_lock = threading.Lock()
+    # http.client 的 request target 只给 path 会丢 query，必须显式拼回
+    request_target = parsed.path + (("?" + parsed.query) if parsed.query else "")
+
+    def worker(tag):
+        try:
+            if parsed.scheme == "https":
+                c = HTTPSConnection(parsed.hostname, parsed.port or 443,
+                                    timeout=FIRST_BYTE_TIMEOUT)
+            else:
+                c = HTTPConnection(parsed.hostname, parsed.port or 80,
+                                   timeout=FIRST_BYTE_TIMEOUT)
+            with conn_lock:
+                conns[tag] = c
+            c.request(method, request_target, body=body, headers=headers)
+            r = c.getresponse()
+            result_q.put((tag, True, c, r))
+        except Exception as e:
+            result_q.put((tag, False, None, e))
+
+    wait_total = bucket.acquire()
+    threads = {}
+    th = threading.Thread(target=worker, args=("A",), name="upstream-A", daemon=True)
+    th.start(); threads["A"] = th
+    alive = {"A"}
+    hedged = False
+    bad = None       # 首个非 200 响应 (conn, resp)，另一条还在跑时留待兜底
+    last_err = None
+
+    def cleanup_losers():
+        """winner 已定：关闭仍在阻塞的连接，排空并关闭已完成的备用连接。"""
+        wasted = 0
+        with conn_lock:
+            for other in list(alive):
+                oc = conns.get(other)
+                if oc is not None:
+                    try:
+                        oc.close()
+                    except Exception:
+                        pass
+        while True:
+            try:
+                _, ok2, c2, _r2 = result_q.get_nowait()
+            except _queue.Empty:
+                break
+            if ok2 and c2 is not None:
+                wasted += 1
+                try:
+                    c2.close()
+                except Exception:
+                    pass
+        if bad is not None:
+            try:
+                bad[0].close()
+            except Exception:
+                pass
+        for t in threads.values():
+            t.join(timeout=1.0)
+        return wasted
+
+    while True:
+        try:
+            tag, ok, c, r = result_q.get(timeout=(None if hedged else HEDGE_DELAY))
+        except _queue.Empty:
+            # 主连接迟迟不出响应头：取第二个令牌开备用连接竞速
+            wait_total += bucket.acquire()
+            th = threading.Thread(target=worker, args=("B",), name="upstream-B", daemon=True)
+            th.start(); threads["B"] = th
+            alive.add("B"); hedged = True
+            logging.info("[%s] [hedge] 主连接 %.0fs 无响应头，启动备用连接竞速",
+                         _ts(), HEDGE_DELAY)
+            continue
+
+        alive.discard(tag)
+        if ok and r.status == 200:
+            wasted = cleanup_losers()
+            if hedged:
+                logging.info("[%s] [hedge] 连接 %s 胜出%s",
+                             _ts(), tag,
+                             "，备用连接也已成功，多耗 1 次上游处理" if wasted else "")
+            return c, r, wait_total, hedged
+        if ok:
+            # 429/5xx：另一条还在跑就给它机会，否则返回此响应由调用方处理
+            if alive:
+                if bad is None:
+                    bad = (c, r)
+                else:
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
+                continue
+            return c, r, wait_total, hedged
+        # 连接层异常
+        last_err = r
+        if alive:
+            continue
+        if bad is not None:
+            return bad[0], bad[1], wait_total, hedged
+        raise last_err
+
+
+def forward_stream(handler, bucket, upstream_url, method, headers, body, path, stats, client=None):
     """流式透传：立即回 SSE 响应头，等待上游期间用心跳帧给客户端保活。
 
     令牌桶排队、429 退避、上游首字节前的空等，都按 HEARTBEAT_INTERVAL
@@ -650,7 +811,7 @@ def forward_stream(handler, bucket, upstream_url, method, headers, body, path, s
     rate_limit_attempt = 0
     rate_limit_start = None
 
-    _detail_logger.log_request(req_id, method, upstream_url + path, headers, body)
+    _detail_logger.log_request(req_id, method, upstream_url + path, headers, body, client)
 
     full_url = upstream_url.rstrip("/") + path
     parsed = urllib.parse.urlparse(full_url)
@@ -658,29 +819,65 @@ def forward_stream(handler, bucket, upstream_url, method, headers, body, path, s
     write_lock = threading.Lock()
 
     def cwrite(data):
+        """按 HTTP/1.1 chunked 编码写一个分块并立即 flush。"""
+        if not data:
+            return
         with write_lock:
+            handler.wfile.write(f"{len(data):X}\r\n".encode("ascii"))
             handler.wfile.write(data)
+            handler.wfile.write(b"\r\n")
             handler.wfile.flush()
 
-    # 排队/等待前先发出 SSE 响应头（hook 已在调用处处理完 block）
+    def cend():
+        """chunked 结束块。"""
+        with write_lock:
+            handler.wfile.write(b"0\r\n\r\n")
+            handler.wfile.flush()
+
+    # 排队/等待前先发出 SSE 响应头（hook 已在调用处处理完 block）。
+    # 必须用 HTTP/1.1 + chunked：HTTP/1.0+close 定界会被很多客户端整体
+    # 缓冲到连接结束，心跳帧无法被 SSE 解析器增量消费。
     try:
+        handler.protocol_version = "HTTP/1.1"
         handler.send_response(200)
         handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
         handler.send_header("Cache-Control", "no-cache")
         handler.send_header("X-Accel-Buffering", "no")
+        handler.send_header("Transfer-Encoding", "chunked")
+        handler.send_header("Connection", "close")
         handler.end_headers()
         handler.wfile.flush()
-        handler.close_connection = True  # 无 Content-Length，以连接关闭定界
+        handler.close_connection = True
     except OSError as e:
         logging.warning("[%s] [client] 流式响应头未发出客户端已断开：%s", _ts(), e)
         return 499, [], b"", True
 
     stop_beat = threading.Event()
+    # 首个真实上游 chunk 是否已透传：此前发“零内容 OpenAI chunk”充当有效
+    # SSE 事件（实测 Trae 有首事件超时，注释帧不算有效事件），此后发注释帧
+    stream_state = {"first_event": False}
+    try:
+        req_model = json.loads(body.decode("utf-8", errors="replace")).get("model") or ""
+    except (ValueError, UnicodeDecodeError, AttributeError):
+        req_model = ""
+
+    def empty_event_frame():
+        payload = json.dumps({
+            "id": "chatcmpl-proxy-heartbeat",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": req_model,
+            "choices": [{"index": 0,
+                         "delta": {"role": "assistant", "content": ""},
+                         "finish_reason": None}],
+        }, ensure_ascii=False)
+        return ("data: " + payload + "\n\n").encode("utf-8")
 
     def heartbeat():
         while not stop_beat.wait(HEARTBEAT_INTERVAL):
+            frame = b": heartbeat\n\n" if stream_state["first_event"] else empty_event_frame()
             try:
-                cwrite(b": heartbeat\n\n")
+                cwrite(frame)
             except OSError:
                 return  # 客户端断开，透传循环写时会感知并收尾
 
@@ -689,27 +886,19 @@ def forward_stream(handler, bucket, upstream_url, method, headers, body, path, s
 
     final_status = 0
     final_headers = []
+    final_ttfb = None
     resp_buf = bytearray()
     client_gone = False
 
-    def finish(status, hdr):
-        nonlocal final_status, final_headers
-        final_status, final_headers = status, hdr
-
     try:
         while True:
-            wait = bucket.acquire()
-            _detail_logger.mark_sent(req_id, wait)
             t0 = time.monotonic()
             conn = None
             try:
-                if parsed.scheme == "https":
-                    conn = HTTPSConnection(parsed.hostname, parsed.port or 443, timeout=120)
-                else:
-                    conn = HTTPConnection(parsed.hostname, parsed.port or 80, timeout=120)
-
-                conn.request(method, parsed.path, body=body, headers=headers)
-                resp = conn.getresponse()
+                # 并行竞速建连（内部取令牌：主连接 1 个，触发 hedge 时再取 1 个）
+                conn, resp, wait_total, hedged = _stream_race_connection(
+                    parsed, method, headers, body, bucket)
+                _detail_logger.mark_sent(req_id, wait_total)
 
                 # 429：心跳继续，内部退避重试（受总时限约束）
                 if resp.status == 429:
@@ -738,7 +927,7 @@ def forward_stream(handler, bucket, upstream_url, method, headers, body, path, s
                                 '{"error":{"message":"upstream rate limited too long","code":429}}'))
                         except OSError:
                             client_gone = True
-                        finish(429, resp.getheaders())
+                        final_status = 429
                         resp_buf.extend(rb)
                         break
                     _detail_logger.log_error(
@@ -774,10 +963,11 @@ def forward_stream(handler, bucket, upstream_url, method, headers, body, path, s
 
                 # 200：逐块透传；心跳线程继续负责 chunk 间空闲保活
                 delivered = False
+                ttfb_ms = None
                 while True:
                     try:
                         chunk = resp.read(4096)
-                    except (socket.timeout, TimeoutError) as e:
+                    except (socket.timeout, TimeoutError):
                         if not delivered:
                             # 一个上游字节都没转发：抛出走外层连接重试
                             raise
@@ -794,7 +984,15 @@ def forward_stream(handler, bucket, upstream_url, method, headers, body, path, s
                     resp_buf.extend(chunk)
                     try:
                         cwrite(chunk)
-                        delivered = True
+                        if not delivered:
+                            delivered = True
+                            ttfb_ms = (time.monotonic() - t0) * 1000
+                            stream_state["first_event"] = True
+                            # 已开始出字：放宽 chunk 间等待，允许长回答慢慢吐
+                            try:
+                                conn.sock.settimeout(MID_STREAM_TIMEOUT)
+                            except Exception:
+                                pass
                     except OSError:
                         client_gone = True
                         logging.warning(
@@ -803,9 +1001,10 @@ def forward_stream(handler, bucket, upstream_url, method, headers, body, path, s
                 duration = time.monotonic() - t0
                 stats.record(method, path, 200, duration, extract_usage(bytes(resp_buf)))
                 final_status = 200
+                final_ttfb = ttfb_ms
                 break
 
-            except (urllib.error.URLError, OSError) as e:
+            except (OSError, HTTPException) as e:
                 duration = time.monotonic() - t0
                 if attempt < MAX_RETRIES:
                     stats.record(method, path, 0, duration)
@@ -831,10 +1030,29 @@ def forward_stream(handler, bucket, upstream_url, method, headers, body, path, s
                         conn.close()
                     except Exception:
                         pass
+    except Exception as e:
+        # 兜底：BadStatusLine 等非 OSError 异常绝不能穿透——否则调用方收到
+        # 裸 502，recent 里状态永远停在 None，异常堆栈只出现在 stderr 容易丢
+        import traceback
+        logging.error("[%s] [stream] 未预期异常: %s\n%s", _ts(), e, traceback.format_exc())
+        _detail_logger.log_error(req_id, f"unexpected: {e!r}", 0.0)
+        stats.record(method, path, 502, 0.0)
+        try:
+            cwrite(_sse_error_frame(json.dumps(
+                {"error": {"message": f"proxy stream error: {e}"}}, ensure_ascii=False)))
+        except OSError:
+            client_gone = True
+        final_status = 502
     finally:
         stop_beat.set()
+        if not client_gone:
+            try:
+                cend()
+            except OSError:
+                client_gone = True
 
-    _detail_logger.log_response(req_id, final_status, final_headers, bytes(resp_buf))
+    _detail_logger.log_response(req_id, final_status, final_headers,
+                                bytes(resp_buf), ttfb_ms=final_ttfb)
     if client_gone:
         logging.warning(
             "[%s] [client] 调用方流式接收中断，上游实际返回 %d，%dB 未送达",
@@ -1116,10 +1334,17 @@ class V1ProxyHandler(RPCRequestHandler):
         if isinstance(body, str):
             body = body.encode("utf-8")
         self.send_response(status)
-        for k, v in (headers or {}).items():
-            self.send_header(k, v)
-        self.send_header("Content-Type", (headers or {}).get(
-            "Content-Type", "application/json"))
+        sh = headers or {}
+        sh_lower = {k.lower() for k in sh}
+        # 逐跳/定界头不能由调用方决定：CL 按本地 body 重算，TE 不支持；
+        # server/date 由 send_response() 自动生成
+        hop = {"content-length", "transfer-encoding", "connection",
+               "keep-alive", "server", "date"}
+        for k, v in sh.items():
+            if k.lower() not in hop:
+                self.send_header(k, v)
+        if "content-type" not in sh_lower:
+            self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         if body:
@@ -1179,14 +1404,32 @@ class V1ProxyHandler(RPCRequestHandler):
                     body = nb.encode("utf-8") if isinstance(nb, str) else nb
             # allow → 继续转发
 
-        # 3) 转发到上游
+        # 3) 转发到上游（流式请求走透传+心跳，其余走缓冲转发）
+        already_sent = False
         try:
-            status, resp_headers, resp_body = forward_request(
-                self.bucket, self.upstream, method, headers, body, self.path, self.stats
-            )
+            if _is_stream_body(body):
+                status, resp_headers, resp_body, already_sent = forward_stream(
+                    self, self.bucket, self.upstream, method, headers, body,
+                    self.path, self.stats, client=self.client_address)
+            else:
+                status, resp_headers, resp_body = forward_request(
+                    self.bucket, self.upstream, method, headers, body, self.path,
+                    self.stats, client=self.client_address)
         except Exception as e:
             logging.error("upstream error: %s", e)
             self.recorder.capture_response(seq, 502, {}, str(e), note="upstream error")
+            if already_sent:
+                # 流式路径响应头已发，只能补一个 chunked SSE 错误帧 + 结束块
+                try:
+                    frame = _sse_error_frame(
+                        json.dumps({"error": {"message": f"proxy error: {e}"}},
+                                   ensure_ascii=False))
+                    self.wfile.write(f"{len(frame):X}\r\n".encode("ascii"))
+                    self.wfile.write(frame + b"\r\n0\r\n\r\n")
+                    self.wfile.flush()
+                except OSError:
+                    pass
+                return
             self.send_response(502)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
@@ -1196,18 +1439,28 @@ class V1ProxyHandler(RPCRequestHandler):
         # 4) 录制完整响应（不截断）
         self.recorder.capture_response(seq, status, dict(resp_headers), resp_body)
 
-        # 5) 回写客户端
+        # 5) 回写客户端（流式路径已在 forward_stream 中透传完毕，跳过）
+        if already_sent:
+            return
         try:
             self.send_response(status)
-            skip_resp = {"transfer-encoding", "connection", "keep-alive", "trailer"}
+            # content-length：上游 chunked 响应经 resp.read() 解码后无 CL，
+            # 必须按本地 body 重算，否则客户端拿不到 body 边界；
+            # content-type：循环只跳过不重发，统一在下面发一次，避免重复头；
+            # server/date：send_response() 已自动生成，不透传上游的值
+            skip_resp = {"transfer-encoding", "connection", "keep-alive",
+                         "trailer", "content-length", "content-type",
+                         "server", "date"}
             for k, v in resp_headers:
                 if k.lower() in skip_resp:
                     continue
                 self.send_header(k, v)
-            ct = dict(resp_headers).get("Content-Type", "application/json")
-            self.send_header("Content-Type", ct)
+            self.send_header(
+                "Content-Type", dict(resp_headers).get("Content-Type", "application/json"))
+            if method != "HEAD":
+                self.send_header("Content-Length", str(len(resp_body or b"")))
             self.end_headers()
-            if resp_body:
+            if method != "HEAD" and resp_body:
                 self.wfile.write(resp_body)
         except (BrokenPipeError, ConnectionResetError, OSError) as e:
             # 上游已正常返回，但调用方（如 IDE）等不及提前断开——
@@ -1290,11 +1543,8 @@ class ProxyManager:
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    # 重定向到文件时 stdout 默认块缓冲，会导致日志迟迟不落盘；强制行缓冲
-    try:
-        sys.stdout.reconfigure(line_buffering=True)
-    except Exception:
-        pass
+    # 所有 print 同步落盘 proxy.live.log（控制台窗口丢失也能排查）
+    install_file_logging()
 
     parser = argparse.ArgumentParser(description="本地聚合代理：RPC + Sapiens AI 反向代理 + 动态限速")
     parser.add_argument("--port", type=int, default=2255, help="监听端口（默认 2255）")
@@ -1336,6 +1586,8 @@ def main():
         format="%(asctime)s [proxy] %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
     )
+    # basicConfig 的 StreamHandler 绑定的是已被 Tee 替换的 stderr，logging 输出
+    # 自然同步进 proxy.live.log，无需再加文件 handler（否则每条记录落盘两遍）
 
     # 把局部变量写入模块 globals，让 RPC executor 可以直接访问
     globals()['bucket'] = bucket
@@ -1345,8 +1597,7 @@ def main():
     globals()['interceptor'] = interceptor
     globals()['recent'] = _detail_logger.recent  # 最近 3 个请求/回复内存快照，RPC 排查用
 
-    print("=" * 70)
-    print("本地聚合代理已启动")
+    
     print(f"  监听:   http://127.0.0.1:{args.port}")
     print(f"  RPC:    /r=...  (Python 代码执行)")
     print(f"  代理:   /v1/*   → {args.upstream}/v1")
