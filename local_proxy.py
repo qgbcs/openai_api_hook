@@ -61,23 +61,97 @@ def set_console_title(text):
 
 # ─── 详细日志 ────────────────────────────────────────────────────────────────
 
+class RecentRing:
+    """内存中保留最近 N 个请求/上游回复的完整快照，供 RPC 排查。
+
+    RPC 用法：
+      recent.list()                  摘要（id/时刻/状态/大小/耗时/重试）
+      recent.get(-1)                 最新一条完整内容（headers+body）
+      recent.get(-1)["resp_body"]    只看上游响应原文
+    """
+
+    def __init__(self, cap=3):
+        self._items = deque(maxlen=cap)
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _text(body):
+        if body is None:
+            return None
+        if isinstance(body, str):
+            return body
+        try:
+            return body.decode('utf-8', errors='replace')
+        except Exception:
+            return f"[{len(body)}B binary]"
+
+    @staticmethod
+    def _mask_headers(headers):
+        if not headers:
+            return {}
+        items = headers.items() if isinstance(headers, dict) else headers
+        out = {}
+        for k, v in items:
+            out[k] = "***" if k.lower() == "authorization" else v
+        return out
+
+    def add(self, item):
+        with self._lock:
+            self._items.append(item)
+            return item
+
+    def list(self):
+        with self._lock:
+            return [{
+                'id': x.get('id'), 'arrival': x.get('arrival'),
+                'method': x.get('method'), 'path': x.get('path'),
+                'status': x.get('status'),
+                'req_bytes': len(x.get('req_body') or b'') if x.get('req_body') else 0,
+                'resp_bytes': len(x.get('resp_body') or b'') if x.get('resp_body') else 0,
+                'wait_s': round(x.get('wait', 0.0), 2),
+                'up_ms': round(x.get('up_ms', 0.0)) if x.get('up_ms') else None,
+                'retries': len(x.get('retry_events', [])),
+            } for x in self._items]
+
+    def get(self, idx=-1):
+        """返回一条完整快照（文本化的 headers/body），默认最新一条。"""
+        with self._lock:
+            x = self._items[idx]
+            return {
+                'id': x.get('id'), 'arrival': x.get('arrival'),
+                'method': x.get('method'), 'path': x.get('path'),
+                'status': x.get('status'),
+                'wait_s': x.get('wait', 0.0), 'up_ms': x.get('up_ms'),
+                'req_headers': self._mask_headers(x.get('req_headers')),
+                'req_body': self._text(x.get('req_body')),
+                'resp_headers': x.get('resp_headers'),
+                'resp_body': self._text(x.get('resp_body')),
+                'retry_events': x.get('retry_events', []),
+            }
+
+
 class DetailLogger:
     """请求/响应日志。默认紧凑单行：请求一行、回复一行。
     RPC 可设置 _detail_logger.verbose = True 强制展开全部 header 与 body。
+    最近 3 个请求/回复完整保存在 recent（RecentRing），RPC 可随时查看。
     """
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._active = {}  # request_id -> {start, ts, method, url}
+        self._active = {}  # request_id -> 日志/快照条目
         self.verbose = False
+        self.recent = RecentRing(cap=3)
 
     def log_request(self, req_id, method, url, headers, body=None):
         with self._lock:
             now = time.monotonic()
-            self._active[req_id] = {
-                'arrival': now, 'start': now, 'wait': 0.0,
-                'ts': _ts(), 'method': method, 'url': url,
+            item = {
+                'id': req_id, 'arrival': _ts(), 'method': method,
+                'path': url, 'req_headers': headers, 'req_body': body,
+                'start': now, 'wait': 0.0, 'retry_events': [],
             }
+            self._active[req_id] = item
+            self.recent.add(item)
             # 请求一到达（读完 body）立即留痕：即使后续在令牌桶排队，
             # 日志里也能看到未配对的 >>>，不会出现“调用方超时但日志空白”
             n = len(body) if body else 0
@@ -103,14 +177,18 @@ class DetailLogger:
             if not info:
                 return
             up_ms = (time.monotonic() - info['start']) * 1000
+            info.update({'status': status, 'up_ms': up_ms,
+                         'resp_headers': headers, 'resp_body': body})
             usage = extract_usage(body)
             wait_s = f" wait={info['wait']:.1f}s" if info['wait'] > 0.05 else ""
+            n_retry = len(info['retry_events'])
+            retry_s = f" retry={n_retry}" if n_retry else ""
             tok = ""
             if usage:
                 tok = (f" sent={usage.get('prompt_tokens')} "
                        f"recv={usage.get('completion_tokens')}")
-            print(f"[{info['ts']}] <<< #{req_id} {status} {self._status_text(status)} "
-                  f"up={up_ms:.0f}ms{wait_s}{tok}")
+            print(f"[{info['arrival']}] <<< #{req_id} {status} {self._status_text(status)} "
+                  f"up={up_ms:.0f}ms{wait_s}{retry_s}{tok}")
             if self.verbose:
                 for k, v in headers:
                     if k.lower() not in ('transfer-encoding', 'connection'):
@@ -120,10 +198,16 @@ class DetailLogger:
 
     def log_error(self, req_id, error, elapsed):
         with self._lock:
-            # 不 pop：429 重试后还要记录最终响应，pop 会导致成功响应日志丢失
+            # 不 pop：429/网络重试后还要记录最终响应，pop 会导致成功响应日志丢失
             info = self._active.get(req_id)
-            ts = info['ts'] if info else _ts()
-            print(f"[{ts}] !!! #{req_id} {elapsed*1000:.0f}ms {error}")
+            if info is not None:
+                info['retry_events'].append(
+                    {'ts': _ts(), 'attempt_ms': round(elapsed * 1000), 'error': str(error)})
+                arrival = info['arrival']
+            else:
+                arrival = '?'
+            # 时间戳必须用“此刻”而非请求到达时刻，否则长超时后看起来像错误发生在过去
+            print(f"[{_ts()}] !!! #{req_id} (到达 {arrival}, 本次尝试 {elapsed*1000:.0f}ms) {error}")
 
     @staticmethod
     def _print_body(body):
@@ -317,8 +401,10 @@ class TokenBucket:
         self._last = time.monotonic()
         self._lock = threading.Lock()
         # 软限速：余量低于一半时按缺口比例渐进加延时，避免后半段瞬间耗尽触发 429
-        # 0 表示关闭；可由 RPC 调整，如 bucket.soft_delay_max = 30
-        self.soft_delay_max = 15.0
+        # 0 表示关闭；可由 RPC 调整，如 bucket.soft_delay_max = 15
+        # 默认 8s：叠加令牌硬等最坏约 6.7s，单请求最坏等待约 15s，
+        # 尽量控制在调用方（IDE）客户端超时之内
+        self.soft_delay_max = 8.0
 
     def acquire(self):
         """取一个令牌，返回实际等待秒数（令牌硬等 + 软延迟之和）。"""
@@ -1021,6 +1107,7 @@ def main():
     globals()['proxy'] = proxy
     globals()['recorder'] = recorder
     globals()['interceptor'] = interceptor
+    globals()['recent'] = _detail_logger.recent  # 最近 3 个请求/回复内存快照，RPC 排查用
 
     print("=" * 70)
     print("本地聚合代理已启动")
